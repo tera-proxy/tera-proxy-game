@@ -428,7 +428,7 @@ function manifestFromCaali(manifest) {
 	manifest = {data: manifest.files}
 	for(let file in manifest.data) {
 		let hash = manifest.data[file]
-		if(hash.hash) hash = hash
+		if(hash.hash) hash = hash.hash
 		manifest.data[file] = Buffer.from(hash, 'hex').toString('base64')
 	}
 	return manifest
