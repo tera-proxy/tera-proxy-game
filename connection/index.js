@@ -5,10 +5,11 @@ const Encryption = require('./encryption')
 const PacketBuffer = require('../packetBuffer')
 
 class Connection {
-	constructor(info) {
+	constructor(dispatch, info) {
 		this.info = info
 		this.client = null
-		this.dispatch = new Dispatch(this)
+		this.dispatch = dispatch
+		dispatch.connection = this // TODO: Consider refactoring
 
 		this.state = -1
 		this.session = new Encryption()

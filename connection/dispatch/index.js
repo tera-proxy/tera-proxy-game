@@ -11,11 +11,9 @@ protocol.load(require.resolve('tera-data'))
 
 const latestDefVersion = new Map()
 
-if(protocol.messages) {
-	for(const [name, defs] of protocol.messages) {
+if(protocol.messages)
+	for(const [name, defs] of protocol.messages)
 		latestDefVersion.set(name, Math.max(...defs.keys()))
-	}
-}
 
 function* iterateHooks(globalHooks = [], codeHooks = []) {
 	const globalHooksIterator = globalHooks[Symbol.iterator](); // .values()
@@ -40,8 +38,8 @@ function* iterateHooks(globalHooks = [], codeHooks = []) {
 
 function getHookName(hook) {
 	const callbackName = hook.callback ? (hook.callback.name || '(anonymous)') : '<unknown>',
-		namespace = hook.namespace || '<unknown>'
-	return `${callbackName} in ${namespace}`
+		modName = hook.modName || '<unknown>'
+	return `${callbackName} in ${modName}`
 }
 
 function getMessageName(map, identifier, version, originalName) {
@@ -99,100 +97,107 @@ function errStack(err = new Error(), removeFront = true) {
 	return stack.map(frame => frame.source).join('\n')
 }
 
+function pluralize(number, noun, ext, extNon) { return `${number} ${noun + (number !== 1 ? (ext || 's') : (extNon || ''))}` }
+
 // -----------------------------------------------------------------------------
 
 class Dispatch extends EventEmitter {
-	constructor(connection, protocolVersion) {
+	constructor(modManager, protocolVersion) {
 		super()
 
-		this.connection = connection
-		this.modules = new Map()
+		Object.assign(this, {
+			modManager: modManager,
+			connection: null,
+			loadedMods: new Map(),
+			hooks: new Map(), // hooks.set(code, [{order, hooks: [...]}, ...])
 
-		// hooks:
-		// { <code>:
-		//	 [ { <order>
-		//		 , hooks:
-		//			 [ { <code>, <filter>, <order>, <definitionVersion>, <namespace>, <callback> }
-		//			 ]
-		//		 }
-		//	 ]
-		// }
-		this.hooks = new Map()
+			require: new Proxy(Object.create(null), {
+				get: (obj, key) => {
+					const mod = this.load(key)
+					if(!mod) throw Error(`Required mod not found: ${key}`)
+					return mod
+				},
+				set() { throw TypeError('Cannot set property of require')}
+			})
+		})
 
 		if(protocolVersion) this.setProtocolVersion(protocolVersion)
 	}
 
 	reset() {
-		for(const name of this.modules.keys()) {
-			this.unload(name)
-		}
+		for(const name of this.loadedMods.keys()) this.unload(name, true)
 
-		this.modules.clear()
-		this.hooks.clear()
+		this.hooks.clear() // Clean up any broken hooks - TODO: Properly check these and generate warnings
 	}
 
-	load(name, from = module, ...args) {
-		const mod = this.modules.get(name)
-		if(mod) return mod
+	loadAll() {
+		// Statistics
+		const startTime = Date.now(),
+			count = {true: 0, false: 0}
 
-		if(typeof from.require !== 'function' && typeof from === 'function')
-			from = { require: (ModuleConstructor => () => ModuleConstructor)(from) } // `from` is a function, so use itself the module constructor
+		for(let name of this.modManager.packages.keys()) count[!!this.load(name)]++
+
+		log.info(`Loaded ${pluralize(count.true, 'mod')} in ${Date.now() - startTime}ms${
+			count.false ? log.color('91', ` (${count.false} failed)`) : ''
+		}`)
+	}
+
+	load(name) {
+		let mod = this.loadedMods.get(name)
+		if(mod !== undefined) return mod.instance
+
+		if(!this.modManager.canLoad(name)) return null
+
+		const pkg = this.modManager.packages.get(name)
+		if(!pkg) return null
+
+		log.info(`Loading ${log.color('1', name)}${(() => {
+			switch(pkg._compat) {
+				case 1: return ` ${log.color('90', '(legacy)')}`
+				case 2: return ` ${log.color('90', '(caali-compat)')}`
+				default: return ''
+			}
+		})()}`)
 
 		try {
-			const ModuleConstructor = from.require(name),
-				wrapper = new Wrapper(this, name),
-				loadedModule = new ModuleConstructor(wrapper, ...args)
-			this.modules.set(name, loadedModule)
-
-			log.info(`[dispatch] loaded "${name}"`)
-
-			return loadedModule
+			const mod = new Wrapper(require(this.modManager.resolve(name)), pkg, this)
+			this.loadedMods.set(name, mod)
+			return mod.instance
 		}
 		catch (e) {
-			// Remove any hooks that may have been added by the broken mod
-			for(const orderings of this.hooks.values())
-				for(const ordering of orderings)
-					ordering.hooks = ordering.hooks.filter(hook => hook.namespace !== name)
+			log.error(e)
 
-			log.error(`[dispatch] load: error initializing mod "${name}"`)
-			console.error(e)
+			this.unhookAll(name) // Remove any hooks that may have been added by the broken mod
+			this.modManager.brokenMods.add(name)
+			return null
 		}
-
-		return null
 	}
 
-	unload(name) {
-		const mod = this.modules.get(name)
+	unload(name, force = false) {
+		const mod = this.loadedMods.get(name)
+		if(!mod || !mod.instance.destructor && !force) return false
 
-		if(!mod) {
-			log.error([
-				`[dispatch] unload: cannot unload non-loaded module "${name}"`,
-				errStack(),
-			].join('\n'))
-			return false
+		this.unhookAll(name)
+
+		try {
+			mod.destroy()
+		}
+		catch(e) {
+			log.error(`Error running destructor for mod "${name}"`)
+			log.error(e)
 		}
 
-		for(const orderings of this.hooks.values())
-			for(const ordering of orderings)
-				ordering.hooks = ordering.hooks.filter(hook => hook.namespace !== name)
-
-		if(typeof mod.destructor === 'function') {
-			try {
-				mod.destructor()
-			} catch (e) {
-				log.error([
-					`[dispatch] unload: error running destructor for module "${name}"`,
-					`error: ${e.message}`,
-					errStack(e),
-				].join('\n'))
-			}
-		}
-
-		this.modules.delete(name)
+		this.loadedMods.delete(name)
 		return true
 	}
 
-	hook(namespace, name, version, opts, cb) {
+	unhookAll(name) {
+		for(const orderings of this.hooks.values())
+			for(const ordering of orderings)
+				ordering.hooks = ordering.hooks.filter(hook => hook.modName !== name)
+	}
+
+	hook(modName, name, version, opts, cb) {
 		// Parse args
 		if(typeof version !== 'number' && version !== '*' && version !== 'raw') throw TypeError(`[dispatch] hook: invalid version specified (${version})`)
 		if(typeof opts === 'function') {
@@ -230,7 +235,7 @@ class Dispatch extends EventEmitter {
 		// Create hook
 		const order = opts.order || 0,
 			hook = {
-				namespace, // TODO: Replace with wrapper ref
+				modName,
 				code,
 				filter: Object.assign({
 					fake: false,
@@ -274,33 +279,20 @@ class Dispatch extends EventEmitter {
 	write(outgoing, name, version, data) {
 		if(!this.connection) return false
 
-		if(Buffer.isBuffer(name)) data = Buffer.from(name)
+		if(Buffer.isBuffer(name)) data = Buffer.from(name) // Raw mode
 		else {
-			if(typeof version !== 'number' && typeof version !== 'string') {
-				log.error(`[dispatch] write: version is required\n${errStack()}`)
-				return false
-			}
+			if(typeof version !== 'number' && version !== '*') throw TypeError(`[dispatch] write: invalid version specified (${version})`)
 
 			if(version !== '*') {
 				const latest = latestDefVersion.get(name)
-				if(latest && version < latest) {
-					log.warn([
+				if(latest && version < latest)
+					log.dwarn([
 						`[dispatch] write: ${getMessageName(this.protocolMap, name, version, name)} is not latest version (${latest})`,
 						errStack()
 					].join('\n'))
-				}
 			}
 
-			try {
-				data = protocol.write(this.protocolVersion, name, version, data)
-			} catch (e) {
-				log.error([
-					`[dispatch] write: failed to generate ${getMessageName(this.protocolMap, name, version, name)}`,
-					`error: ${e.message}`,
-					errStack(e, false)
-				].join('\n'))
-				return false
-			}
+			data = protocol.write(this.protocolVersion, name, version, data)
 		}
 
 		data = this.handle(data, !outgoing, true)
@@ -318,21 +310,21 @@ class Dispatch extends EventEmitter {
 			if(revisions[version]) {
 				this.setRevision(revisions[version])
 
-				log.info(`[dispatch] detected protocol version ${version} - patch ${this.getPatchVersion()}`)
+				log.info(`Detected protocol version ${version} - patch ${this.getPatchVersion()}`)
 
 				const sysmsgVersion = this.sysmsgVersion || this.majorPatchVersion
 				// Uncomment if sysmsg differs by minor patch version in multiple regions at once
 				//const sysmsgVersion = this.sysmsgVersion || this.majorPatchVersion + this.minorPatchVersion.toString().padStart(2, '0')
 
 				this.sysmsgMap = sysmsg.maps.get(sysmsgVersion)
-				if(!this.sysmsgMap) log.warn(`[dispatch] sysmsg.${sysmsgVersion}.map not found`)
+				if(!this.sysmsgMap) log.warn(`sysmsg.${sysmsgVersion}.map not found`)
 
 				this.emit('init')
 			}
-			else log.error('[dispatch] entry for protocol ${version} not found in revisions.json')
+			else log.error(`Entry for protocol ${version} not found in revisions.json`)
 		}
 		else if(version !== 0)
-			log.error(`[dispatch] unmapped protocol version ${version}`)
+			log.error(`Unmapped protocol version ${version}`)
 	}
 
 	setRevision(rev) {
@@ -359,9 +351,7 @@ class Dispatch extends EventEmitter {
 		if(!name) throw Error(`Unmapped system message ${id} ("${message}")`)
 
 		const data = {}
-
 		for(let i = 2; i < tokens.length; i += 2) data[tokens[i - 1]] = tokens[i]
-
 		return {id: name, tokens: data}
 	}
 
@@ -375,15 +365,12 @@ class Dispatch extends EventEmitter {
 		}
 
 		const id = message.id.toString().includes(':') ? message.id : this.sysmsgMap.name.get(message.id)
-
 		if(!id) throw Error(`Unknown system message "${message.id}"`)
 
 		data = message.tokens
 
 		let str = '@' + id
-
 		for(let key in data) str += `\v${key}\v${data[key]}`
-
 		return str
 	}
 
@@ -412,10 +399,9 @@ class Dispatch extends EventEmitter {
 			catch(e) {
 				log.error([
 					'[dispatch] handle: failed to parse C_CHECK_VERSION<1> for dynamic protocol versioning',
-					`data: ${data.toString('hex')}`,
-					`error: ${e.message}`,
-					errStack(e),
+					`data: ${data.toString('hex')}`
 				].join('\n'))
+				log.error(e)
 			}
 		}
 
