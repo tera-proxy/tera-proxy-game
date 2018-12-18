@@ -101,9 +101,8 @@ class ModWrapper {
 
 		try {
 			// Call mod-defined destructor
-			const destructor = this.instance.destructor
-			if(destructor) {
-				destructor(unload)
+			if(this.instance.destructor) {
+				this.instance.destructor(unload)
 				return true
 			}
 		}
