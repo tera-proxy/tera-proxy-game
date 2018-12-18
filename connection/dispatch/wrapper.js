@@ -75,10 +75,10 @@ class ModWrapper {
 			if(settingsVersion)
 				try {
 					if(this.settings._version !== settingsVersion) {
-						mod.settings = require(
+						this.settings = require(
 							path.join(this.rootFolder, this.options.settingsMigrator || 'module_settings_migrator.js')
-						)(mod.settings._version, settingsVersion, mod.settings)
-						mod.settings._version = settingsVersion
+						)(this.settings._version, settingsVersion, this.settings)
+						this.settings._version = settingsVersion
 					}
 				}
 				catch(e) {
