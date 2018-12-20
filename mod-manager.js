@@ -94,7 +94,7 @@ class ModManager {
 						_compat: 2,
 						_compatInfo: caaliPkg,
 						name: caaliPkg.name || safeName,
-						update: caaliPkg.servers[0],
+						update: caaliPkg.servers && caaliPkg.servers[0],
 						conflicts: caaliPkg.conflicts,
 						title: caaliPkg.options.guiName || baseName,
 						version: caaliPkg.version,
